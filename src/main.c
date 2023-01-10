@@ -1,6 +1,62 @@
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+
+#ifdef _WIN32
+#include <conio.h>
+#include <windows.h>
+
+HANDLE hStdin = INVALID_HANDLE_VALUE;
+DWORD fdwMode, fdwOldMode;
+
+void disable_input_buffering() {
+    hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    GetConsoleMode(hStdin, &fdwOldMode);
+    fdwMode = fdwOldMode ^ ENABLE_ECHO_INPUT ^ ENABLE_LINE_INPUT;
+    SetConsoleMode(hStdin, fdwMode);
+    FlushConsoleInputBuffer(hStdin);
+}
+
+void restore_input_buffering() { SetConsoleMode(hStdin, fdwOldMode); }
+
+uint16_t check_key() {
+    return WaitForSingleObject(hStdin, 1000) == WAIT_OBJECT_0 && _kbhit();
+}
+
+#else
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/termios.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+struct termios original_tio;
+
+void disable_input_buffering() {
+    tcgetattr(STDIN_FILENO, &original_tio);
+    struct termios new_tio = original_tio;
+    new_tio.c_lflag &= ~ICANON & ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
+}
+
+void restore_input_buffering() {
+    tcsetattr(STDIN_FILENO, TCSANOW, &original_tio);
+}
+
+uint16_t check_key() {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(STDIN_FILENO, &readfds);
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    return select(1, &readfds, NULL, NULL, &timeout) != 0;
+}
+#endif
 
 #define MEMORY_MAX (1 << 16)
 
@@ -60,6 +116,11 @@ enum trap_code {
     TRAP_HALT = 0x25,  /* Halt the program*/
 };
 
+enum mem_m_reg {
+    MR_KBSR = 0xFF00, /* Keyboard status */
+    MR_KBDR = 0xFF02  /* Keyboard data */
+};
+
 typedef struct {
     VMState state;
     bool running;
@@ -67,6 +128,20 @@ typedef struct {
     uint16_t memory[MEMORY_MAX]; /* 2^16 locations */
     uint16_t reg[R_COUNT];
 } VM;
+
+void memWrite(VM *vm, uint16_t addr, uint16_t val) { vm->memory[addr] = val; }
+
+uint16_t memRead(VM *vm, uint16_t addr) {
+    if (addr == MR_KBSR) {
+        if (check_key()) {
+            vm->memory[MR_KBSR] = (1 << 15);
+            vm->memory[MR_KBDR] = getchar();
+        } else {
+            vm->memory[MR_KBSR] = 0;
+        }
+    }
+    return vm->memory[addr];
+}
 
 void vmReset(VM *vm) {
     *vm = (VM){0};
@@ -95,7 +170,7 @@ void updateFlags(VM *vm, uint16_t r) {
 #define IMM(i, n) ((i) & (n))
 #define IMM5(i) signExtend(IMM(i, 0x1F), 5)
 #define BIT_F(i, n) ((i) >> n & 0x1)
-#define SETCC(r) updateFlags(&vm, r)
+#define SETCC(r) updateFlags(vm, r)
 #define PC_OFFSET9(i) signExtend(IMM(i, 0x1FF), 9)
 #define PC_OFFSET11(i) signExtend(IMM(i, 0x7FF), 11)
 #define BS_OFFSET6(i) signExtend(IMM(i, 0x3F), 6)
@@ -170,7 +245,7 @@ void run(VM *vm, uint16_t instr) {
         case OP_AND: {
             vm->reg[DR(instr)] =
                 vm->reg[SR1(instr)] &
-                (IMM_F(instr) ? IMM5(instr) : vm->reg[SR2(instr)]);
+                (BIT_F(instr, 5) ? IMM5(instr) : vm->reg[SR2(instr)]);
             SETCC(DR(instr));
             break;
         }
@@ -237,12 +312,13 @@ void run(VM *vm, uint16_t instr) {
         }
         case OP_TRAP: {
             vm->reg[R_R7] = vm->reg[R_PC];
-            trap(&vm, instr);
+            trap(vm, instr);
             break;
         }
         case OP_RES:
         case OP_RTI:
         default: {
+            abort();
             break;
         }
     }
@@ -263,9 +339,7 @@ void run(VM *vm, uint16_t instr) {
 #undef BASE_R
 #undef TRAP_VECT8
 
-static inline uint16_t swap16(uint16_t x) {
-    return (x << 8) | (x >> 8);
-}
+static inline uint16_t swap16(uint16_t x) { return (x << 8) | (x >> 8); }
 
 void readImageFile(VM *vm, FILE *file) {
     uint16_t origin;
@@ -284,10 +358,18 @@ void readImageFile(VM *vm, FILE *file) {
 
 int readImage(VM *vm, const char *imagePath) {
     FILE *file = fopen(imagePath, "rb");
-    if (!file) { return 0; }
+    if (!file) {
+        return 0;
+    }
     readImageFile(vm, file);
     fclose(file);
     return 1;
+}
+
+void handle_interrupt(int signal) {
+    restore_input_buffering();
+    printf("\n");
+    exit(-2);
 }
 
 int main(int argc, char **argv) {
@@ -306,11 +388,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    signal(SIGINT, handle_interrupt);
+    disable_input_buffering();
+
     while (vm.running) {
         uint16_t instr = memRead(&vm, vm.reg[R_PC]);
         vm.reg[R_PC]++;
         run(&vm, instr);
     }
 
+    restore_input_buffering();
     return 0;
 }
